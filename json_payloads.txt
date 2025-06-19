@@ -1,0 +1,37 @@
+POST /onboard_driver
+Content-Type: application/json
+
+{
+  "user_id": "driver-002",
+  "name": "Alex Yu",
+  "license_number": "AZ12345678",
+  "license_expiry": "2027-10-15",
+  "vehicle_type": "Sedan",
+  "vehicle_plate": "AZM6789",
+  "capacity": 4,
+  "max_detour_minutes": 10
+}
+
+POST /match_driver
+Content-Type: application/json
+
+{
+  "ride_id": "replace_with_ride_id",
+  "driver_id": "driver-002"
+}
+
+POST /update_location
+Content-Type: application/json
+
+{
+  "ride_id": "replace_with_ride_id",
+  "lat": 30.6162,
+  "lng": -96.3408
+}
+
+POST /complete_ride
+Content-Type: application/json
+
+{
+  "ride_id": "replace_with_ride_id"
+}

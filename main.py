@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from database import SessionLocal
-from models import Ride, RideStatus, User, LocationUpdate, DriverProfile
+from models import Ride, RideStatus, User, LocationUpdate, DriverProfile, DetourScoreLog
 import uuid
 import requests
 from datetime import datetime, UTC
@@ -46,12 +46,48 @@ class DriverOnboarding(BaseModel):
     vehicle_plate: str
     capacity: int = 4
     max_detour_minutes: int = 10
+
+# -----------------------
+# Ride Status Enum
+# -----------------------
+class SetDriverLocationRequest(BaseModel):
+    driver_id: str
+    lat: float
+    lng: float
+
+class Location(BaseModel):
+    lat: float
+    lng: float
+    address: str
+
 # -----------------------
 # Home Check
 # -----------------------
 @app.get("/")
 def home():
-    return {"message": "Kamuit backend is running 🚀"}
+    return {"message": "Kamuit backend is running"}
+
+# -----------------------
+#  Set Driver Location
+# -----------------------
+@app.post("/set_driver_location")
+def set_driver_location(data: SetDriverLocationRequest, db: Session = Depends(get_db)):
+    profile = db.query(DriverProfile).filter_by(user_id=data.driver_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    profile.lat = data.lat
+    profile.lng = data.lng
+    db.commit()
+
+    return {
+        "message": "Driver GPS updated",
+        "driver_id": data.driver_id,
+        "lat": data.lat,
+        "lng": data.lng
+    }
+
+
 
 # -----------------------
 #  Request Ride
@@ -77,7 +113,7 @@ def request_ride(data: RideRequest, db: Session = Depends(get_db)):
         "summary": response["routes"][0]["summary"]
     }
 
-    fare_estimate = int((route_summary["distance"] / 1000) * 1.5 * 100)  # cents
+    fare_estimate = int((route_summary["distance"] / 1000) * 1.5 * 100)  # cents -> requird logicical equation from Managemnt
 
     ride = Ride(
         id=str(uuid.uuid4()),
@@ -113,35 +149,154 @@ def request_ride(data: RideRequest, db: Session = Depends(get_db)):
 # -----------------------
 @app.post("/assign_driver")
 def assign_driver(ride_data: dict = Body(...), db: Session = Depends(get_db)):
-    ride_id = ride_data.get("ride_id")
+    from models import DetourScoreLog
 
+    ride_id = ride_data.get("ride_id")
     ride = db.query(Ride).filter_by(id=ride_id, status=RideStatus.requested).first()
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found or already matched")
 
-    # Get drivers not currently assigned to an active ride
+    # Get active driver IDs
     active_driver_ids = db.query(Ride.driver_id).filter(
         Ride.status.in_([RideStatus.accepted, RideStatus.in_progress])
     ).distinct().all()
     active_driver_ids = [d[0] for d in active_driver_ids if d[0]]
 
-    available_driver = db.query(User).filter(
-        User.role == "driver",
-        ~User.id.in_(active_driver_ids)
-    ).first()
+    # Get idle, GPS-ready drivers
+    candidates = db.query(DriverProfile).filter(
+        ~DriverProfile.user_id.in_(active_driver_ids),
+        DriverProfile.lat.isnot(None),
+        DriverProfile.lng.isnot(None)
+    ).all()
 
-    if not available_driver:
-        raise HTTPException(status_code=503, detail="No available drivers")
+    if not candidates:
+        raise HTTPException(status_code=503, detail="No available drivers with GPS")
 
-    ride.driver_id = available_driver.id
+    detour_candidates = []
+    for driver in candidates:
+        origin = f"{driver.lat},{driver.lng}"
+        destination = f"{ride.pickup_lat},{ride.pickup_lng}"
+
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {
+            "origin": origin,
+            "destination": destination,
+            "key": GOOGLE_KEY
+        }
+
+        try:
+            response = requests.get(url, params=params).json()
+            if "routes" not in response or not response["routes"]:
+                continue
+
+            detour_duration_s = response["routes"][0]["legs"][0]["duration"]["value"]
+            detour_minutes = detour_duration_s / 60.0
+
+            # ⛔ Skip if detour exceeds driver's threshold
+            if detour_minutes > driver.max_detour_minutes:
+                continue
+
+            detour_candidates.append((driver.user_id, detour_duration_s))
+        except Exception:
+            continue
+
+    if not detour_candidates:
+        raise HTTPException(status_code=503, detail="No suitable driver found (all detours too high?)")
+
+    # Pick driver with lowest detour
+    detour_candidates.sort(key=lambda x: x[1])
+    chosen_driver_id, best_detour = detour_candidates[0]
+
+    # Assign ride
+    ride.driver_id = chosen_driver_id
     ride.status = RideStatus.accepted
     ride.accepted_at = datetime.now(UTC)
+    db.commit()
+
+    # Log detour scores
+    for driver_id, detour in detour_candidates:
+        db.add(DetourScoreLog(
+            ride_id=ride.id,
+            driver_id=driver_id,
+            detour_duration_s=detour,
+            was_accepted=1 if driver_id == chosen_driver_id else 0
+        ))
     db.commit()
 
     return {
         "ride_id": ride.id,
         "driver_id": ride.driver_id,
+        "detour_duration_s": best_detour,
         "status": ride.status.value
+    }
+
+
+# -----------------------
+# Fallback Check
+# -----------------------
+@app.post("/fallback_check")
+def fallback_check(data: dict = Body(...), db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    fallback_timeout = data.get("timeout", 30)
+
+    ride = db.query(Ride).filter_by(id=ride_id).first()
+    if not ride or ride.status != RideStatus.accepted:
+        raise HTTPException(status_code=404, detail="No active ride for fallback check")
+
+    elapsed = (datetime.now(UTC) - ride.accepted_at).total_seconds()
+    if elapsed < fallback_timeout:
+        return {"status": "waiting", "seconds_since_assignment": elapsed}
+
+    db.query(DetourScoreLog).filter_by(ride_id=ride_id, driver_id=ride.driver_id).update(
+        {"was_accepted": -1}
+    )
+    db.commit()
+
+    ride.driver_id = None
+    ride.status = RideStatus.requested
+    db.commit()
+
+    return {"status": "fallback_triggered", "elapsed_s": elapsed}
+
+# -----------------------
+# Update Driver Location
+# -----------------------
+@app.post("/update_location")
+def update_location(data: dict = Body(...), db: Session = Depends(get_db)):
+    ride_id = data.get("ride_id")
+    driver_id = data.get("driver_id")
+    location = data.get("location")
+
+    if not location or "lat" not in location or "lng" not in location:
+        raise HTTPException(status_code=400, detail="Invalid location data")
+
+    ride = db.query(Ride).filter_by(id=ride_id, driver_id=driver_id).first()
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found or driver mismatch")
+
+    update = LocationUpdate(
+        id=str(uuid.uuid4()),
+        ride_id=ride_id,
+        driver_id=driver_id,
+        lat=location["lat"],
+        lng=location["lng"],
+        timestamp=datetime.now(UTC)
+    )
+
+    db.add(update)
+
+    profile = db.query(DriverProfile).filter_by(user_id=driver_id).first()
+    if profile:
+        profile.lat = location["lat"]
+        profile.lng = location["lng"]
+
+    db.commit()
+
+    return {
+        "message": "Location updated",
+        "ride_id": ride_id,
+        "driver_id": driver_id,
+        "timestamp": update.timestamp.isoformat()
     }
 
 # -----------------------
